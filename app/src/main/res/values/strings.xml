@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">卡片滚动性能验证</string>
+    <string name="expand_card">展开</string>
+    <string name="collapse_card">收起</string>
+    <string name="expanded_state">已展开</string>
+    <string name="collapsed_state">已收起</string>
+    <string name="prepare_cards">正在后台生成并排版首屏卡片…</string>
+    <string name="auto_scroll">自动急速滚动</string>
+    <string name="stop_scroll">停止滚动</string>
+    <string name="regenerate">重新随机生成</string>
+    <string name="reset_metrics">重置统计</string>
+</resources>
