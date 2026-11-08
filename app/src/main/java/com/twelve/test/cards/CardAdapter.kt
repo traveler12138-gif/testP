@@ -7,16 +7,24 @@ class CardAdapter(
     private val repository: CardRepository,
     val expandedItems: BooleanArray = BooleanArray(CARD_COUNT),
 ) : RecyclerView.Adapter<CardAdapter.Holder>() {
+    private var ready = false
+
     init {
         setHasStableIds(true)
         stateRestorationPolicy = StateRestorationPolicy.PREVENT_WHEN_EMPTY
     }
 
-    override fun getItemCount() = CARD_COUNT
+    override fun getItemCount() = if (ready) CARD_COUNT else 0
     override fun getItemId(position: Int) = position.toLong()
 
+    fun showItems() {
+        if (ready) return
+        ready = true
+        notifyItemRangeInserted(0, CARD_COUNT)
+    }
+
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder {
-        val view = CardView(parent.context)
+        val view = CardView(parent.context, repository.style)
         view.layoutParams = RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         return Holder(view, expandedItems)
     }

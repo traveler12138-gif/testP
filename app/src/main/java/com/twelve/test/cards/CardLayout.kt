@@ -2,27 +2,33 @@ package com.twelve.test.cards
 
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Paint
+import android.os.Build
 import android.os.Trace
 import android.text.Layout
+import android.text.PrecomputedText
 import android.text.StaticLayout
 import android.text.TextDirectionHeuristics
-import android.text.TextPaint
 import android.text.TextUtils
 import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
 import android.widget.TextView
-import java.util.Locale
 import java.util.Random
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 const val CARD_COUNT = 1_000
+const val MAX_CARD_ROWS = 10
 
 data class CardRow(val key: String, val value: String)
 
 class RowLayout(
-    val key: StaticLayout,
-    val value: StaticLayout,
+    val key: PrecomputedText,
+    val value: PrecomputedText,
+    val keyHeight: Int,
+    val valueHeight: Int,
     val top: Int,
     val height: Int,
 )
@@ -31,46 +37,126 @@ class CardLayout(
     val id: Int,
     val rows: Array<RowLayout>,
     val fullContentHeight: Int,
-    val accessibilityText: String,
     val style: CardStyle,
 ) {
-    val expandable = fullContentHeight + style.buttonHeight > style.collapsedHeight
+    val expandable = fullContentHeight > style.collapsedHeight
     val collapsedHeight = if (expandable) style.collapsedHeight else fullContentHeight
     val expandedHeight = fullContentHeight + if (expandable) style.buttonHeight else 0
+    val collapsedContentHeight = collapsedHeight - if (expandable) style.buttonHeight else 0
+    val collapsedRowCount = rows.indexOfFirst { it.top >= collapsedContentHeight }
+        .let { if (it < 0) rows.size else it }
 }
 
 class CardStyle(context: Context, val width: Int) {
-    private val resources = context.resources
-    private val metrics = resources.displayMetrics
+    private val density = context.resources.displayMetrics.density
     val padding = dp(16)
     val rowGap = dp(9)
     val columnGap = dp(12)
     val radius = dp(12).toFloat()
     val collapsedHeight = dp(200)
-    val buttonHeight = dp(48)
-    val rtl = resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
-    val locale: Locale = resources.configuration.locales[0]
+    val rtl = context.resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
+    val keySpec = CardTextSpec(context, 14f, Color.rgb(104, 116, 136), 1, rtl)
+    val valueSpec = CardTextSpec(context, 16f, Color.rgb(27, 37, 55), 2, rtl)
+    val buttonSpec = CardTextSpec(context, 14f, Color.rgb(37, 92, 203), 1, rtl)
+    private val buttonFont = buttonSpec.params.textPaint.fontMetricsInt
+    private val buttonMinimum = buttonSpec.minimumFontMetrics
+    val buttonHeight = max(
+        dp(48),
+        max(buttonFont.bottom - buttonFont.top, buttonMinimum?.let { (it.bottom - it.top).roundToInt() } ?: 0) + dp(16),
+    )
     val keyWidth = max(1, ((width - padding * 2 - columnGap) * 0.30f).roundToInt())
     val valueWidth = max(1, width - padding * 2 - columnGap - keyWidth)
     val keyX = if (rtl) width - padding - keyWidth else padding
     val valueX = if (rtl) padding else padding + keyWidth + columnGap
-    val keyPaint = makePaint(context, 14f, Color.rgb(104, 116, 136))
-    val valuePaint = makePaint(context, 16f, Color.rgb(27, 37, 55))
-    val buttonPaint = makePaint(context, 14f, Color.rgb(37, 92, 203))
 
-    fun dp(value: Int) = (value * metrics.density).roundToInt()
+    fun dp(value: Int) = (value * density).roundToInt()
+}
 
-    private fun makePaint(context: Context, sizeSp: Float, color: Int): TextPaint {
-        // 通过 TextView 获取系统字体、字重调整和字体回退参数，SP 换算也交给系统处理非线性缩放。
+class CardTextSpec(
+    context: Context,
+    sizeSp: Float,
+    private val color: Int,
+    val maxLines: Int,
+    private val rtl: Boolean,
+) {
+    val params: PrecomputedText.Params
+    val minimumFontMetrics: Paint.FontMetrics?
+    private val useBoundsForWidth: Boolean
+    private val shiftDrawingOffset: Boolean
+
+    init {
+        // 在主线程获取系统字体、字重调整和 SP 非线性缩放，工作线程只使用参数快照。
         val prototype = TextView(context)
         prototype.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
-        prototype.setTextColor(color)
-        prototype.textLocale = locale
-        return TextPaint(prototype.paint).apply { this.color = color }
+        prototype.textLocales = context.resources.configuration.locales
+        configure(prototype)
+        params = prototype.textMetricsParams
+        if (Build.VERSION.SDK_INT >= 35) {
+            useBoundsForWidth = prototype.useBoundsForWidth
+            shiftDrawingOffset = prototype.shiftDrawingOffsetForStartOverhang
+            minimumFontMetrics = prototype.minimumFontMetrics
+                ?: if (prototype.isLocalePreferredLineHeightForMinimumUsed) {
+                    Paint.FontMetrics().also { prototype.paint.getFontMetricsForLocale(it) }
+                } else null
+        } else {
+            useBoundsForWidth = false
+            shiftDrawingOffset = false
+            minimumFontMetrics = null
+        }
+    }
+
+    fun createView(context: Context): TextView = TextView(context).also(::applyTo)
+
+    fun applyTo(view: TextView) {
+        configure(view)
+        // 与后台 PrecomputedText 的参数完全一致，避免 setText 触发参数不匹配或重新塑形。
+        view.textMetricsParams = params
+        view.setTextColor(color)
+        if (Build.VERSION.SDK_INT >= 35) {
+            view.useBoundsForWidth = useBoundsForWidth
+            view.shiftDrawingOffsetForStartOverhang = shiftDrawingOffset
+            view.setLocalePreferredLineHeightForMinimumUsed(false)
+            view.minimumFontMetrics = minimumFontMetrics
+        }
+    }
+
+    fun configureLayout(builder: StaticLayout.Builder) {
+        if (Build.VERSION.SDK_INT >= 33) builder.setLineBreakConfig(params.lineBreakConfig)
+        if (Build.VERSION.SDK_INT >= 35) {
+            // 新系统默认的语言最小行高和字形边界参与换行，必须与 TextView 一同快照。
+            builder.setUseBoundsForWidth(useBoundsForWidth)
+            builder.setMinimumFontMetrics(minimumFontMetrics)
+        }
+    }
+
+    private fun configure(view: TextView) {
+        view.setPadding(0, 0, 0, 0)
+        view.minWidth = 0
+        view.minHeight = 0
+        view.minimumWidth = 0
+        view.minimumHeight = 0
+        view.maxLines = maxLines
+        // 不使用 setSingleLine，保留正常宽度约束和原生 END 省略行为。
+        view.setHorizontallyScrolling(false)
+        view.ellipsize = TextUtils.TruncateAt.END
+        view.includeFontPadding = true
+        view.setFallbackLineSpacing(true)
+        view.setLineSpacing(0f, 1f)
+        view.breakStrategy = Layout.BREAK_STRATEGY_SIMPLE
+        view.hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE
+        view.textDirection = if (rtl) View.TEXT_DIRECTION_FIRST_STRONG_RTL else View.TEXT_DIRECTION_FIRST_STRONG_LTR
+        view.gravity = Gravity.TOP or Gravity.START
+        view.isHorizontalFadingEdgeEnabled = false
+        view.isVerticalFadingEdgeEnabled = false
+        view.setTextIsSelectable(false)
+        view.isSaveEnabled = false
     }
 }
 
 class CardLayoutFactory(private val style: CardStyle, private val seed: Long) {
+    // key 文案只有固定字段与有限序号组合，缓存其高度，减少后台重复换行测量。
+    private val keyHeights = ConcurrentHashMap<String, Int>()
+
     fun build(position: Int): CardLayout {
         Trace.beginSection("Card.prepareText")
         try {
@@ -78,16 +164,18 @@ class CardLayoutFactory(private val style: CardStyle, private val seed: Long) {
             var top = style.padding
             val rows = Array(source.size) { index ->
                 val item = source[index]
-                val key = textLayout(item.key, style.keyPaint, style.keyWidth, 1)
-                val value = textLayout(item.value, style.valuePaint, style.valueWidth, 2)
-                val height = max(key.height, value.height)
-                RowLayout(key, value, top, height).also { top += height + style.rowGap }
+                val key = PrecomputedText.create(item.key, style.keySpec.params)
+                val value = PrecomputedText.create(item.value, style.valueSpec.params)
+                val keyHeight = keyHeights[item.key] ?: textHeight(key, style.keySpec, style.keyWidth)
+                    .also { keyHeights.putIfAbsent(item.key, it) }
+                val valueHeight = textHeight(value, style.valueSpec, style.valueWidth)
+                val height = max(keyHeight, valueHeight)
+                RowLayout(key, value, keyHeight, valueHeight, top, height).also { top += height + style.rowGap }
             }
             return CardLayout(
                 position,
                 rows,
                 top - style.rowGap + style.padding,
-                source.joinToString("\n") { "${it.key}：${it.value}" },
                 style,
             )
         } finally {
@@ -95,19 +183,21 @@ class CardLayoutFactory(private val style: CardStyle, private val seed: Long) {
         }
     }
 
-    private fun textLayout(text: String, sourcePaint: TextPaint, width: Int, maxLines: Int): StaticLayout {
-        // 每个 Layout 独占 TextPaint；工作线程与主线程不会并发修改同一支画笔。
-        return StaticLayout.Builder.obtain(text, 0, text.length, TextPaint(sourcePaint), width)
+    private fun textHeight(text: PrecomputedText, spec: CardTextSpec, width: Int): Int {
+        // StaticLayout 仅用于后台计算高度，绘制全部由原生 TextView 完成，不缓存两份布局。
+        return StaticLayout.Builder.obtain(text, 0, text.length, android.text.TextPaint(spec.params.textPaint), width)
             .setAlignment(Layout.Alignment.ALIGN_NORMAL)
             .setTextDirection(if (style.rtl) TextDirectionHeuristics.FIRSTSTRONG_RTL else TextDirectionHeuristics.FIRSTSTRONG_LTR)
             .setIncludePad(true)
+            .setUseLineSpacingFromFallbacks(true)
             .setLineSpacing(0f, 1f)
             .setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE)
             .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
-            .setMaxLines(maxLines)
+            .setMaxLines(spec.maxLines)
             .setEllipsize(TextUtils.TruncateAt.END)
             .setEllipsizedWidth(width)
-            .build()
+            .also(spec::configureLayout)
+            .build().height
     }
 
     private fun generate(position: Int): List<CardRow> {
